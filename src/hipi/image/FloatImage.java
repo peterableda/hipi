@@ -13,11 +13,11 @@ import org.apache.hadoop.io.Writable;
  * Base class for FloatImage's. A FloatImage is just an array of floating-point
  * values along with information about the dimensions of the image that array
  * represents. The is the default image type that is used in HIPI.
- * 
+ *
  * You can convert to other image types using ImageConverter.
- * 
+ *
  * @see hipi.image.convert.ImageConverter
- * 
+ *
  */
 public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 
@@ -27,42 +27,121 @@ public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 	private float[] _pels;
 
 	public FloatImage() {}
-	
+
 	public FloatImage(int width, int height, int bands, float[] pels) {
 		_w = width;
 		_h = height;
 		_b = bands;
 		_pels = pels;
 	}
-	
+
 	public FloatImage(int width, int height, int bands) {
 		this(width, height, bands, new float[width * height * bands]);
 	}
-	
-	@Override
-	public boolean equals(Object that) {
-		if (this == that)
-			return true;
-		if (!(that instanceof FloatImage))
-			return false;
-		FloatImage thatImage = (FloatImage)that;
-		if (thatImage.getWidth() == _w && thatImage.getHeight() == _h &&
-			thatImage.getBands() == _b) {
-			float delta = 1.0f;
-			float[] pels = thatImage.getData();
-			for (int i = 0; i < _w * _h * _b; i++) {
-				if (Math.abs(_pels[i] - pels[i]) > delta) {
-					return false;
+
+	public FloatImage deepCopy() {
+		return new FloatImage(getWidth(),
+				getHeight(),
+				getBands(),
+				_pels.clone());
+	}
+
+	// define kernel here (double loop), these are the 1/16, 2/16, etc...
+	// values that you're multiplying the image pixels by
+	public FloatImage convolve(float[][] kernel) {
+		int kernel_rows = kernel.length;
+		int kernel_cols = kernel[0].length;
+
+		// iterate over each pixel in the image
+		// leave a kernel_rows/2 sized gap around the edge of the image
+		// so that we don't run into IndexOutOfBounds exceptions
+		// when performing the convolution
+		FloatImage convolved_image = this.deepCopy();
+		for (int row = kernel_rows/2; row < _h - (kernel_rows - kernel_rows/2); row++) {
+			for (int col = kernel_cols/2; col < _w - (kernel_rows - kernel_cols/2); col++) {
+
+				float[] band_pix = new float[_b];
+				// iterate over each pixel in the kernel
+				for (int row_offset = 0 ; row_offset < kernel_rows; row_offset++ ) {
+					for (int col_offset = 0 ; col_offset < kernel_cols; col_offset++ ) {
+						// subtract by half the kernel size to center the kernel
+						// on the pixel in question
+						int row_index = row + row_offset - kernel_rows/2;
+						int col_index = col + col_offset - kernel_cols/2;
+						for (int band = 0; band < _b; band++) {
+							band_pix[band] += this.getPixel(col_index, row_index, band) * kernel[row_offset][col_offset];
+						}
+					}
+				}
+				for (int band = 0; band < _b; band++) {
+					convolved_image.setPixel(col, row, band, band_pix[band]);
 				}
 			}
-			return true;
 		}
-		return false;
+		return convolved_image;
 	}
-	
+
+	public FloatImage downsample(int factor) {
+		// Create 5x5 gaussian kernel
+		float[][] gauss_kernel = new float[][]{{1, 4, 6, 4, 1},
+				{4, 16, 24, 16, 4},
+				{6, 24, 36, 24, 6},
+				{4, 16, 24, 16, 4},
+				{1, 4, 6, 4, 1}};
+		for (int i = 0; i < 5; i++){
+			for (int j = 0; j < 5; j++){
+				gauss_kernel[i][j] /= (256.0);
+			}
+		}
+
+		FloatImage downsampled_image = this.deepCopy();
+		for (int f = 0; f < factor; f++) {
+			// Blur first, then half-sample
+			FloatImage blurred_image = downsampled_image.convolve(gauss_kernel);
+			downsampled_image = new FloatImage(blurred_image.getWidth()/2, blurred_image.getHeight()/2, _b);
+			// Half-sample
+			for (int i = 0; i < downsampled_image.getWidth(); i++) {
+				for (int j = 0; j < downsampled_image.getHeight(); j++) {
+					for (int k = 0; k < downsampled_image.getBands(); k++)
+						downsampled_image.setPixel(i, j, k, blurred_image.getPixel(2*i, 2*j, k));
+				}
+			}
+		}
+		return downsampled_image;
+	}
+
+	public FloatImage upsample(int factor) {
+		// Create 5x5 gaussian kernel
+		float[][] gauss_kernel = new float[][]{{1, 4, 6, 4, 1},
+				{4, 16, 24, 16, 4},
+				{6, 24, 36, 24, 6},
+				{4, 16, 24, 16, 4},
+				{1, 4, 6, 4, 1}};
+		for (int i = 0; i < 5; i++){
+			for (int j = 0; j < 5; j++){
+				gauss_kernel[i][j] /= (64.0);
+			}
+		}
+
+		FloatImage upsampled_image = this.deepCopy();
+		for (int f = 0; f < factor; f++) {
+			// Blur first, then half-sample
+			FloatImage buffered_image = upsampled_image.deepCopy();
+			upsampled_image = new FloatImage(buffered_image.getWidth()*2, buffered_image.getHeight()*2, _b);
+			// Half-sample
+			for (int i = 0; i < buffered_image.getWidth(); i++) {
+				for (int j = 0; j < buffered_image.getHeight(); j++) {
+					for (int k = 0; k < buffered_image.getBands(); k++)
+						upsampled_image.setPixel(2*i, 2*j, k, buffered_image.getPixel(i, j, k));
+				}
+			}
+			upsampled_image = upsampled_image.convolve(gauss_kernel);
+		}
+		return upsampled_image;
+	}
 	/**
 	 * Crops a float image according the the x,y location and the width, height passed in.
-	 * 
+	 *
 	 * @return a {@link FloatImage} containing the cropped portion of the original image
 	 */
 	public FloatImage crop(int x, int y, int width, int height) {
@@ -72,12 +151,12 @@ public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 				pels[(i - y) * width * _b + j - x * _b] = _pels[i * _w * _b + j];
 		return new FloatImage(width, height, _b, pels);
 	}
-	
+
 	public static final int RGB2GRAY = 0x01;
 
 	/**
 	 * Convert between color types (black and white, grayscale, etc.). Currently only RGB2GRAY
-	 * 
+	 *
 	 * @return A {@link FloatImage} of the converted image. Returns null if the image could not be converted
 	 */
 	public FloatImage convert(int type) {
@@ -91,9 +170,29 @@ public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 		return null;
 	}
 
+	// Assumes there are the same number of bands in both imgs.
+	public FloatImage concatenate(FloatImage new_img) {
+		FloatImage concat_image = new FloatImage(_w + new_img.getWidth(), _h + new_img.getHeight(), _b);
+		// Copy first image
+		for (int i = 0; i < this.getWidth(); i++) {
+			for (int j = 0; j < this.getHeight(); j++){
+				for (int b = 0; b < this.getBands(); b++)
+					concat_image.setPixel(i, j, b, this.getPixel(i, j, b));
+			}
+		}
+		// Copy second image
+		for (int i = 0; i < new_img.getWidth(); i++) {
+			for (int j = 0; j < new_img.getHeight(); j++){
+				for (int b = 0; b < new_img.getBands(); b++)
+					concat_image.setPixel(i + this.getWidth(), j, b, new_img.getPixel(i, j, b));
+			}
+		}
+		return concat_image;
+	}
+
 	/**
 	 * Adds a {@link FloatImage} to the current image
-	 * 
+	 *
 	 * @param image
 	 */
 	public void add(FloatImage image) {
@@ -103,15 +202,35 @@ public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 	}
 	/**
 	 * Adds a scalar to every pixel in the FloatImage
-	 * 
+	 *
 	 * @param number
 	 */
 	public void add(float number) {
 		for (int i = 0; i < _w * _h * _b; i++)
 			_pels[i] += number;
 	}
+
 	/**
-	 * 
+	 * Subtracts a {@link FloatImage} to the current image
+	 *
+	 * @param image
+	 */
+	public void subtract(FloatImage image) {
+		float[] pels = image.getData();
+		for (int i = 0; i < _w * _h * _b; i++)
+			_pels[i] -= pels[i];
+	}
+	/**
+	 * Subtracts a scalar to every pixel in the FloatImage
+	 *
+	 * @param number
+	 */
+	public void subtract(float number) {
+		for (int i = 0; i < _w * _h * _b; i++)
+			_pels[i] -= number;
+	}
+	/**
+	 *
 	 * @param image Each value is scaled by the corresponding value in image
 	 */
 	public void scale(FloatImage image) {
@@ -119,7 +238,7 @@ public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 		for (int i = 0; i < _w * _h * _b; i++)
 			_pels[i] *= pels[i];
 	}
-	
+
 	public void scale(float number) {
 		for (int i = 0; i < _w * _h * _b; i++)
 			_pels[i] *= number;
@@ -128,7 +247,7 @@ public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 	public float getPixel(int x, int y, int c) {
 		return _pels[c + (x + y * _w) * _b];
 	}
-	
+
 	public void setPixel(int x, int y, int c, float val) {
 		_pels[c + (x + y * _w) * _b] = val;
 	}
@@ -148,7 +267,7 @@ public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 	public float[] getData() {
 		return _pels;
 	}
-	
+
 	public String hex() {
 		return ByteUtils.asHex(ByteUtils.FloatArraytoByteArray(_pels));
 	}
@@ -183,7 +302,7 @@ public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 		}
 		return result.toString();
 	}
-	
+
 	/**
 	 * This method comes from the RawComparator class and allows sorting to
 	 * happen much faster than in the normal Comparable interface. For a
@@ -191,7 +310,7 @@ public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 	 * method avoids deserializing the entire FloatImage object before doing a
 	 * comparison. Since the first bytes indicate the size of the image, we can
 	 * just read a small segment of the byte array to get the sizes.
-	 * 
+	 *
 	 * TODO: Ensure that the second and fifth parameters are actually defining
 	 * the start
 	 */
@@ -210,7 +329,7 @@ public class FloatImage implements Writable, RawComparator<BinaryComparable> {
 		int size2 = w2 * h2 * b2;
 
 		System.out.println("here in the compare");
-		
+
 		return (size1 - size2);
 	}
 
